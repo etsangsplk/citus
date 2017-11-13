@@ -39,6 +39,9 @@
 #include "utils/memutils.h"
 
 
+#define CURSOR_OPT_FORCE_DISTRIBUTED 0x080000
+
+
 static List *plannerRestrictionContextList = NIL;
 int MultiTaskQueryLogLevel = MULTI_TASK_QUERY_INFO_OFF; /* multi-task query log level */
 
@@ -90,6 +93,7 @@ static void AdjustParseTree(Query *parse, bool assignRTEIdentities,
 static void AssignRTEIdentity(RangeTblEntry *rangeTableEntry, int rteIdentifier);
 static void PlanPullPushCTEs(Query *query, List **subPlanList);
 static bool CteReferenceListWalker(Node *node, struct CteReferenceWalkerContext *context);
+static bool ContainsResultFunctionWalker(Node *node, void *context);
 static void PlanPullPushSubqueries(Query *query, List **subPlanList);
 static bool PlanPullPushSubqueriesWalker(Node *node, List **planList);
 static bool ContainsReferencesToOuterQuery(Node *node);
@@ -120,6 +124,11 @@ multi_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 	PlannerRestrictionContext *plannerRestrictionContext = NULL;
 	bool assignRTEIdentities = false;
 	bool setPartitionedTablesInherited = false;
+
+	if (cursorOptions & CURSOR_OPT_FORCE_DISTRIBUTED)
+	{
+		needsDistributedPlanning = true;
+	}
 
 	/*
 	 * standard_planner scribbles on it's input, but for deparsing we need the
@@ -249,34 +258,11 @@ NeedsDistributedPlanningWalker(Node *node, void *context)
 		ListCell *rangeTableCell = NULL;
 		bool hasLocalRelation = false;
 		bool hasDistributedRelation = false;
-		Oid readResultsFileFuncId = CitusResultFileFuncId();
 
 		foreach(rangeTableCell, query->rtable)
 		{
 			RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(rangeTableCell);
 			Oid relationId = InvalidOid;
-
-			if (rangeTableEntry->rtekind == RTE_FUNCTION &&
-				rangeTableEntry->functions != NIL)
-			{
-				RangeTblFunction *rangeTableFunction = NULL;
-				FuncExpr *funcExpr = NULL;
-
-				rangeTableFunction = linitial(rangeTableEntry->functions);
-
-				funcExpr = rangeTableFunction->funcexpr;
-				if (funcExpr == NULL)
-				{
-					/* be a little defensive about wacky plans */
-					continue;
-				}
-
-				if (funcExpr->funcid == readResultsFileFuncId)
-				{
-					/* treat result files on workers as distributed relations */
-					hasDistributedRelation = true;
-				}
-			}
 
 			if (rangeTableEntry->rtekind != RTE_RELATION)
 			{
@@ -721,6 +707,7 @@ PlanPullPushCTEs(Query *query, List **subPlanList)
 		Query *resultQuery = NULL;
 		PlannedStmt *subPlan = NULL;
 		ListCell *rteCell = NULL;
+		int cursorOptions = 0;
 
 		/* build a subplan for the CTE */
 		resultQuery = BuildSubPlanResultQuery(subquery, subPlanId);
@@ -764,7 +751,16 @@ PlanPullPushCTEs(Query *query, List **subPlanList)
 			}
 		}
 
-		subPlan = planner(subPlanQuery, 0, NULL);
+		if (ContainsResultFunctionWalker((Node *) subPlanQuery, NULL))
+		{
+			/*
+			 * Make sure we go through distributed planning for a function
+			 * with not relation but only read_records_file calls.
+			 */
+			cursorOptions |= CURSOR_OPT_FORCE_DISTRIBUTED;
+		}
+
+		subPlan = planner(subPlanQuery, cursorOptions, NULL);
 		(*subPlanList) = lappend(*subPlanList, subPlan);
 	}
 
@@ -819,6 +815,37 @@ CteReferenceListWalker(Node *node, struct CteReferenceWalkerContext *context)
 }
 
 
+/*
+ * ContainsResultFunctionWalker
+ */
+static bool
+ContainsResultFunctionWalker(Node *node, void *context)
+{
+	if (node == NULL)
+	{
+		return false;
+	}
+
+	if (IsA(node, FuncExpr))
+	{
+		FuncExpr *funcExpr = (FuncExpr *) node;
+
+		if (funcExpr->funcid == CitusResultFileFuncId())
+		{
+			return true;
+		}
+
+		/* continue into expression_tree_walker */
+	}
+	else if (IsA(node, Query))
+	{
+		return query_tree_walker((Query *) node, ContainsResultFunctionWalker, context, 0);
+	}
+
+	return expression_tree_walker(node, ContainsResultFunctionWalker, context);
+}
+
+
 static bool
 PlanPullPushSubqueriesWalker(Node *node, List **subPlanList)
 {
@@ -848,6 +875,7 @@ PlanPullPushSubqueriesWalker(Node *node, List **subPlanList)
 			PlannedStmt *subPlan = NULL;
 			int subPlanId = list_length(*subPlanList);
 			Query *resultQuery = NULL;
+			int cursorOptions = 0;
 
 			resultQuery = BuildSubPlanResultQuery(query, subPlanId);
 
@@ -855,6 +883,11 @@ PlanPullPushSubqueriesWalker(Node *node, List **subPlanList)
 			pg_get_query_def(resultQuery, r);
 
 			elog(DEBUG1, "replacing subquery %s with: %s", s->data, r->data);
+
+			if (ContainsResultFunctionWalker((Node *) query, NULL))
+			{
+				cursorOptions |= CURSOR_OPT_FORCE_DISTRIBUTED;
+			}
 
 			subPlan = planner(copyObject(query), 0, NULL);
 			(*subPlanList) = lappend(*subPlanList, subPlan);
