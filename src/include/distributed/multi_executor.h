@@ -42,6 +42,7 @@ extern Node * RouterCreateScan(CustomScan *scan);
 extern Node * CoordinatorInsertSelectCreateScan(CustomScan *scan);
 extern Node * DelayedErrorCreateScan(CustomScan *scan);
 extern void CitusSelectBeginScan(CustomScanState *node, EState *estate, int eflags);
+extern void ExecuteSubPlans(List *subPlanList, EState *estate);
 extern TupleTableSlot * RealTimeExecScan(CustomScanState *node);
 extern TupleTableSlot * TaskTrackerExecScan(CustomScanState *node);
 extern void CitusEndScan(CustomScanState *node);
@@ -49,6 +50,8 @@ extern void CitusReScan(CustomScanState *node);
 extern void CitusExplainScan(CustomScanState *node, List *ancestors, struct
 							 ExplainState *es);
 extern TupleTableSlot * ReturnTupleFromTuplestore(CitusScanState *scanState);
+extern void ExecutePlanIntoDestReceiver(PlannedStmt *queryPlan, ParamListInfo params,
+										DestReceiver *dest);
 
 
 #endif /* MULTI_EXECUTOR_H */

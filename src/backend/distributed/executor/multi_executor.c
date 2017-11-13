@@ -246,7 +246,41 @@ DelayedErrorCreateScan(CustomScan *scan)
 void
 CitusSelectBeginScan(CustomScanState *node, EState *estate, int eflags)
 {
-	/* just an empty function */
+	CitusScanState *scanState = (CitusScanState *) node;
+	MultiPlan *multiPlan = scanState->multiPlan;
+	List *subPlanList = multiPlan->subPlanList;
+
+	ExecuteSubPlans(subPlanList, estate);
+
+	/* we are taking locks on partitions of partitioned tables */
+	LockPartitionsInRelationList(multiPlan->relationIdList, AccessShareLock);
+}
+
+
+void
+ExecuteSubPlans(List *subPlanList, EState *estate)
+{
+	ListCell *subPlanCell = NULL;
+	int subPlanId = 0;
+
+	foreach(subPlanCell, subPlanList)
+	{
+		PlannedStmt *subPlan = (PlannedStmt *) lfirst(subPlanCell);
+		DestReceiver *copyDest = NULL;
+		ParamListInfo params = NULL;
+		StringInfo targetFileName = makeStringInfo();
+		List *nodeList = ActivePrimaryNodeList();
+
+		appendStringInfo(targetFileName, "base/pgsql_job_cache/%d_%d_%d_%d.data",
+						 GetUserId(), GetLocalGroupId(), MyProcPid, subPlanId);
+
+		copyDest = (DestReceiver *) CreateRemoteFileDestReceiver(targetFileName->data,
+																 estate, nodeList);
+
+		ExecutePlanIntoDestReceiver(subPlan, params, copyDest);
+
+		subPlanId++;
+	}
 }
 
 
@@ -266,9 +300,6 @@ RealTimeExecScan(CustomScanState *node)
 	{
 		MultiPlan *multiPlan = scanState->multiPlan;
 		Job *workerJob = multiPlan->workerJob;
-
-		/* we are taking locks on partitions of partitioned tables */
-		LockPartitionsInRelationList(multiPlan->relationIdList, AccessShareLock);
 
 		PrepareMasterJobDirectory(workerJob);
 		MultiRealTimeExecute(workerJob);
@@ -466,9 +497,6 @@ TaskTrackerExecScan(CustomScanState *node)
 	{
 		MultiPlan *multiPlan = scanState->multiPlan;
 		Job *workerJob = multiPlan->workerJob;
-
-		/* we are taking locks on partitions of partitioned tables */
-		LockPartitionsInRelationList(multiPlan->relationIdList, AccessShareLock);
 
 		PrepareMasterJobDirectory(workerJob);
 		MultiTaskTrackerExecute(workerJob);

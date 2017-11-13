@@ -65,19 +65,11 @@ static RuleApplyFunction RuleApplyFunctionArray[JOIN_RULE_LAST] = { 0 }; /* join
 
 /* Local functions forward declarations */
 static bool SingleRelationRepartitionSubquery(Query *queryTree);
-static DeferredErrorMessage * DeferErrorIfUnsupportedSubqueryPushdown(Query *
-																	  originalQuery,
-																	  PlannerRestrictionContext
-																	  *
-																	  plannerRestrictionContext);
 static DeferredErrorMessage * DeferErrorIfUnsupportedSublinkAndReferenceTable(
 	Query *queryTree);
 static DeferredErrorMessage * DeferErrorIfUnsupportedFilters(Query *subquery);
 static bool EqualOpExpressionLists(List *firstOpExpressionList,
 								   List *secondOpExpressionList);
-static DeferredErrorMessage * DeferErrorIfCannotPushdownSubquery(Query *subqueryTree,
-																 bool
-																 outerMostQueryHasLimit);
 static DeferredErrorMessage * DeferErrorIfUnsupportedUnionQuery(Query *queryTree,
 																bool
 																outerMostQueryHasLimit);
@@ -192,7 +184,8 @@ MultiLogicalPlanCreate(Query *originalQuery, Query *queryTree,
 	 * standard_planner() may replace the sublinks with anti/semi joins and
 	 * MultiPlanTree() cannot plan such queries.
 	 */
-	if (SubqueryEntryList(queryTree) != NIL || SublinkList(originalQuery) != NIL)
+
+	if (SubqueryEntryList(originalQuery) != NIL || SublinkList(originalQuery) != NIL)
 	{
 		originalQuery = (Query *) ResolveExternalParams((Node *) originalQuery,
 														boundParams);
@@ -508,7 +501,7 @@ SingleRelationRepartitionSubquery(Query *queryTree)
  * to worker nodes. These helper functions returns a deferred error if we
  * cannot push down the subquery.
  */
-static DeferredErrorMessage *
+DeferredErrorMessage *
 DeferErrorIfUnsupportedSubqueryPushdown(Query *originalQuery,
 										PlannerRestrictionContext *
 										plannerRestrictionContext)
@@ -784,7 +777,7 @@ EqualOpExpressionLists(List *firstOpExpressionList, List *secondOpExpressionList
  * limit, we let this query to run, but results could be wrong depending on the
  * features of underlying tables.
  */
-static DeferredErrorMessage *
+DeferredErrorMessage *
 DeferErrorIfCannotPushdownSubquery(Query *subqueryTree, bool outerMostQueryHasLimit)
 {
 	bool preconditionsSatisfied = true;
@@ -1043,8 +1036,6 @@ DeferErrorIfUnsupportedTableCombination(Query *queryTree)
 	ListCell *joinTreeTableIndexCell = NULL;
 	bool unsupporteTableCombination = false;
 	char *errorDetail = NULL;
-	uint32 relationRangeTableCount = 0;
-	uint32 subqueryRangeTableCount = 0;
 
 	/*
 	 * Extract all range table indexes from the join tree. Note that sub-queries
@@ -1067,13 +1058,16 @@ DeferErrorIfUnsupportedTableCombination(Query *queryTree)
 		 * Check if the range table in the join tree is a simple relation or a
 		 * subquery.
 		 */
-		if (rangeTableEntry->rtekind == RTE_RELATION)
+		if (rangeTableEntry->rtekind == RTE_RELATION ||
+			rangeTableEntry->rtekind == RTE_SUBQUERY ||
+			rangeTableEntry->rtekind == RTE_VALUES)
 		{
-			relationRangeTableCount++;
+			/* accepted */
 		}
-		else if (rangeTableEntry->rtekind == RTE_SUBQUERY)
+		else if (rangeTableEntry->rtekind == RTE_FUNCTION &&
+				 !contain_volatile_functions((Node *) rangeTableEntry->functions))
 		{
-			subqueryRangeTableCount++;
+			/* stable and immutable function RTEs are treated as reference tables */
 		}
 		else
 		{
@@ -1700,7 +1694,9 @@ RelationInfoContainsReferenceTable(PlannerInfo *plannerInfo, RelOptInfo *relatio
 		RangeTblEntry *rangeTableEntry = plannerInfo->simple_rte_array[relationId];
 
 		/* relationInfo has this range table entry */
-		if (HasReferenceTable((Node *) rangeTableEntry))
+		if (rangeTableEntry->rtekind == RTE_VALUES ||
+			rangeTableEntry->rtekind == RTE_FUNCTION ||
+			HasReferenceTable((Node *) rangeTableEntry))
 		{
 			return true;
 		}
@@ -2156,7 +2152,8 @@ HasComplexRangeTableType(Query *queryTree)
 		 * subquery.
 		 */
 		if (rangeTableEntry->rtekind != RTE_RELATION &&
-			rangeTableEntry->rtekind != RTE_SUBQUERY)
+			rangeTableEntry->rtekind != RTE_SUBQUERY &&
+			rangeTableEntry->rtekind != RTE_FUNCTION)
 		{
 			hasComplexRangeTableType = true;
 		}
@@ -3009,71 +3006,6 @@ FindNodesOfType(MultiNode *node, int type)
 	}
 
 	return nodeList;
-}
-
-
-/*
- * NeedsDistributedPlanning checks if the passed in query is a query running
- * on a distributed table. If it is, we start distributed planning.
- *
- * For distributed relations it also assigns identifiers to the relevant RTEs.
- */
-bool
-NeedsDistributedPlanning(Query *queryTree)
-{
-	CmdType commandType = queryTree->commandType;
-	List *rangeTableList = NIL;
-	ListCell *rangeTableCell = NULL;
-	bool hasLocalRelation = false;
-	bool hasDistributedRelation = false;
-
-	if (commandType != CMD_SELECT && commandType != CMD_INSERT &&
-		commandType != CMD_UPDATE && commandType != CMD_DELETE)
-	{
-		return false;
-	}
-
-	/*
-	 * We can handle INSERT INTO distributed_table SELECT ... even if the SELECT
-	 * part references local tables, so skip the remaining checks.
-	 */
-	if (InsertSelectIntoDistributedTable(queryTree))
-	{
-		return true;
-	}
-
-	/* extract range table entries for simple relations only */
-	ExtractRangeTableRelationWalker((Node *) queryTree, &rangeTableList);
-
-	foreach(rangeTableCell, rangeTableList)
-	{
-		RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(rangeTableCell);
-
-		/* check if relation is local or distributed */
-		Oid relationId = rangeTableEntry->relid;
-
-		if (IsDistributedTable(relationId))
-		{
-			hasDistributedRelation = true;
-		}
-		else
-		{
-			hasLocalRelation = true;
-		}
-	}
-
-	if (hasLocalRelation && hasDistributedRelation)
-	{
-		if (InsertSelectIntoLocalTable(queryTree))
-		{
-			ereport(ERROR, (errmsg("cannot INSERT rows from a distributed query into a "
-								   "local table")));
-		}
-		ereport(ERROR, (errmsg("cannot plan queries which include both local and "
-							   "distributed relations")));
-	}
-
-	return hasDistributedRelation;
 }
 
 
