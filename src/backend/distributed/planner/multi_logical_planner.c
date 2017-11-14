@@ -56,6 +56,14 @@ typedef struct QualifierWalkerContext
 } QualifierWalkerContext;
 
 
+typedef enum RecurringTuplesType
+{
+	RECURRING_TUPLES_INVALID = 0,
+	RECURRING_TUPLES_REFERENCE_TABLE,
+	RECURRING_TUPLES_FUNCTION
+} RecurringTuplesType;
+
+
 /* Function pointer type definition for apply join rule functions */
 typedef MultiNode *(*RuleApplyFunction) (MultiNode *leftNode, MultiNode *rightNode,
 										 Var *partitionColumn, JoinType joinType,
@@ -88,7 +96,7 @@ static FieldSelect * CompositeFieldRecursive(Expr *expression, Query *query);
 static bool FullCompositeFieldList(List *compositeFieldList);
 static MultiNode * MultiPlanTree(Query *queryTree);
 static void ErrorIfQueryNotSupported(Query *queryTree);
-static bool HasUnsupportedReferenceTableJoin(
+static DeferredErrorMessage * DeferredErrorIfUnsupportedRecurringTuplesJoin(
 	PlannerRestrictionContext *plannerRestrictionContext);
 static bool ShouldRecurseForReferenceTableJoinChecks(RelOptInfo *relOptInfo);
 static bool HasUnsupportedJoinWalker(Node *node, void *context);
@@ -100,8 +108,10 @@ static bool HasOuterJoin(Query *queryTree);
 static bool HasOuterJoinWalker(Node *node, void *maxJoinLevel);
 static bool HasComplexJoinOrder(Query *queryTree);
 static bool HasComplexRangeTableType(Query *queryTree);
-static bool RelationInfoContainsReferenceTable(PlannerInfo *plannerInfo,
-											   RelOptInfo *relationInfo);
+static bool RelationInfoContainsRecurringTuples(PlannerInfo *plannerInfo,
+												RelOptInfo *relationInfo,
+												RecurringTuplesType *recurType);
+static bool HasRecurringTuples(Node *node, RecurringTuplesType *recurType);
 static void ValidateClauseList(List *clauseList);
 static void ValidateSubqueryPushdownClauseList(List *clauseList);
 static bool ExtractFromExpressionWalker(Node *node,
@@ -562,13 +572,10 @@ DeferErrorIfUnsupportedSubqueryPushdown(Query *originalQuery,
 	}
 
 	/* we shouldn't allow reference tables in the outer part of outer joins */
-	if (HasUnsupportedReferenceTableJoin(plannerRestrictionContext))
+	error = DeferredErrorIfUnsupportedRecurringTuplesJoin(plannerRestrictionContext);
+	if (error)
 	{
-		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-							 "cannot pushdown the subquery",
-							 "There exist a reference table in the outer part of the "
-							 "outer join",
-							 NULL);
+		return error;
 	}
 
 	/*
@@ -610,7 +617,7 @@ DeferErrorIfUnsupportedSubqueryPushdown(Query *originalQuery,
  * sublinks into joins.
  *
  * In some cases, sublinks are pulled up and converted into outer joins. Those cases
- * are already handled with HasUnsupportedReferenceTableJoin().
+ * are already handled with DeferredErrorIfUnsupportedRecurringTuplesJoin().
  *
  * If the sublinks are not pulled up, we should still error out in if any reference table
  * appears in the FROM clause of a subquery.
@@ -620,19 +627,31 @@ DeferErrorIfUnsupportedSubqueryPushdown(Query *originalQuery,
 static DeferredErrorMessage *
 DeferErrorIfUnsupportedSublinkAndReferenceTable(Query *queryTree)
 {
+	RecurringTuplesType recurType = RECURRING_TUPLES_INVALID;
+
 	if (!queryTree->hasSubLinks)
 	{
 		return NULL;
 	}
 
-	if (HasReferenceTable((Node *) queryTree->rtable))
+	if (HasRecurringTuples((Node *) queryTree->rtable, &recurType))
 	{
-		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-							 "cannot pushdown the subquery",
-							 "Reference tables are not allowed in FROM "
-							 "clause when the query has subqueries in "
-							 "WHERE clause",
-							 NULL);
+		if (recurType == RECURRING_TUPLES_REFERENCE_TABLE)
+		{
+			return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+								 "cannot pushdown the subquery",
+								 "Reference tables are not allowed in FROM "
+								 "clause when the query has subqueries in "
+								 "WHERE clause", NULL);
+		}
+		else
+		{
+			return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+								 "cannot pushdown the subquery",
+								 "Table functions are not allowed in FROM "
+								 "clause when the query has subqueries in "
+								 "WHERE clause", NULL);
+		}
 	}
 
 	return NULL;
@@ -946,6 +965,7 @@ DeferErrorIfUnsupportedUnionQuery(Query *subqueryTree,
 {
 	List *setOperationStatementList = NIL;
 	ListCell *setOperationStatmentCell = NULL;
+	RecurringTuplesType recurType = RECURRING_TUPLES_INVALID;
 
 	ExtractSetOperationStatmentWalker((Node *) subqueryTree->setOperations,
 									  &setOperationStatementList);
@@ -971,12 +991,9 @@ DeferErrorIfUnsupportedUnionQuery(Query *subqueryTree,
 			leftArgRTI = ((RangeTblRef *) leftArg)->rtindex;
 			leftArgSubquery = (Node *) rt_fetch(leftArgRTI,
 												subqueryTree->rtable)->subquery;
-			if (HasReferenceTable(leftArgSubquery))
+			if (HasRecurringTuples(leftArgSubquery, &recurType))
 			{
-				return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-									 "cannot push down this subquery ",
-									 "Reference tables are not supported with union"
-									 " operator", NULL);
+				break;
 			}
 		}
 
@@ -986,14 +1003,26 @@ DeferErrorIfUnsupportedUnionQuery(Query *subqueryTree,
 			rightArgRTI = ((RangeTblRef *) rightArg)->rtindex;
 			rightArgSubquery = (Node *) rt_fetch(rightArgRTI,
 												 subqueryTree->rtable)->subquery;
-			if (HasReferenceTable(rightArgSubquery))
+			if (HasRecurringTuples(rightArgSubquery, &recurType))
 			{
-				return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-									 "cannot push down this subquery",
-									 "Reference tables are not supported with union"
-									 " operator", NULL);
+				break;
 			}
 		}
+	}
+
+	if (recurType == RECURRING_TUPLES_REFERENCE_TABLE)
+	{
+		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+							 "cannot push down this subquery",
+							 "Reference tables are not supported with union operator",
+							 NULL);
+	}
+	else if (recurType == RECURRING_TUPLES_FUNCTION)
+	{
+		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+							 "cannot push down this subquery",
+							 "Table functions are not supported with union operator",
+							 NULL);
 	}
 
 	return NULL;
@@ -1041,10 +1070,8 @@ DeferErrorIfUnsupportedTableCombination(Query *queryTree)
 	List *rangeTableList = queryTree->rtable;
 	List *joinTreeTableIndexList = NIL;
 	ListCell *joinTreeTableIndexCell = NULL;
-	bool unsupporteTableCombination = false;
+	bool unsupportedTableCombination = false;
 	char *errorDetail = NULL;
-	uint32 relationRangeTableCount = 0;
-	uint32 subqueryRangeTableCount = 0;
 
 	/*
 	 * Extract all range table indexes from the join tree. Note that sub-queries
@@ -1064,28 +1091,50 @@ DeferErrorIfUnsupportedTableCombination(Query *queryTree)
 			(RangeTblEntry *) list_nth(rangeTableList, rangeTableListIndex);
 
 		/*
-		 * Check if the range table in the join tree is a simple relation or a
-		 * subquery.
+		 * Check if the range table in the join tree is a simple relation, a
+		 * subquery, or stable or immutable function.
 		 */
-		if (rangeTableEntry->rtekind == RTE_RELATION)
+		if (rangeTableEntry->rtekind == RTE_RELATION ||
+			rangeTableEntry->rtekind == RTE_SUBQUERY)
 		{
-			relationRangeTableCount++;
+			/* accepted */
 		}
-		else if (rangeTableEntry->rtekind == RTE_SUBQUERY)
+		else if (rangeTableEntry->rtekind == RTE_FUNCTION)
 		{
-			subqueryRangeTableCount++;
+			if (contain_mutable_functions((Node *) rangeTableEntry->functions))
+			{
+				unsupportedTableCombination = true;
+				errorDetail = "Only immutable functions can be used as a table "
+							  "expressions in a multi-shard query";
+			}
+			else
+			{
+				/* stable and immutable function RTEs are treated as reference tables */
+			}
+		}
+		else if (rangeTableEntry->rtekind == RTE_CTE)
+		{
+			unsupportedTableCombination = true;
+			errorDetail = "CTEs in multi-shard queries are currently unsupported";
+			break;
+		}
+		else if (rangeTableEntry->rtekind == RTE_VALUES)
+		{
+			unsupportedTableCombination = true;
+			errorDetail = "VALUES in multi-shard queries is currently unsupported";
+			break;
 		}
 		else
 		{
-			unsupporteTableCombination = true;
-			errorDetail = "Table expressions other than simple relations and "
-						  "subqueries are currently unsupported";
+			unsupportedTableCombination = true;
+			errorDetail = "Table expressions other than relations, subqueries, "
+						  "and immutable functions are currently unsupported";
 			break;
 		}
 	}
 
 	/* finally check and error out if not satisfied */
-	if (unsupporteTableCombination)
+	if (unsupportedTableCombination)
 	{
 		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
 							 "cannot push down this subquery",
@@ -1575,7 +1624,7 @@ MultiPlanTree(Query *queryTree)
 
 
 /*
- * HasUnsupportedReferenceTableJoin returns true if there exists a outer join
+ * DeferredErrorIfUnsupportedRecurringTuplesJoin returns true if there exists a outer join
  * between reference table and distributed tables which does not follow
  * the rules :
  * - Reference tables can not be located in the outer part of the semi join or the
@@ -1590,12 +1639,14 @@ MultiPlanTree(Query *queryTree)
  * definitely have duplicate rows. Beside, reference tables can not be used
  * with full outer joins because of the same reason.
  */
-static bool
-HasUnsupportedReferenceTableJoin(PlannerRestrictionContext *plannerRestrictionContext)
+static DeferredErrorMessage *
+DeferredErrorIfUnsupportedRecurringTuplesJoin(
+	PlannerRestrictionContext *plannerRestrictionContext)
 {
 	List *joinRestrictionList =
 		plannerRestrictionContext->joinRestrictionContext->joinRestrictionList;
 	ListCell *joinRestrictionCell = NULL;
+	RecurringTuplesType recurType = RECURRING_TUPLES_INVALID;
 
 	foreach(joinRestrictionCell, joinRestrictionList)
 	{
@@ -1609,24 +1660,40 @@ HasUnsupportedReferenceTableJoin(PlannerRestrictionContext *plannerRestrictionCo
 		if (joinType == JOIN_SEMI || joinType == JOIN_ANTI || joinType == JOIN_LEFT)
 		{
 			if (ShouldRecurseForReferenceTableJoinChecks(outerrel) &&
-				RelationInfoContainsReferenceTable(plannerInfo, outerrel))
+				RelationInfoContainsRecurringTuples(plannerInfo, outerrel, &recurType))
 			{
-				return true;
+				break;
 			}
 		}
 		else if (joinType == JOIN_FULL)
 		{
 			if ((ShouldRecurseForReferenceTableJoinChecks(innerrel) &&
-				 RelationInfoContainsReferenceTable(plannerInfo, innerrel)) ||
+				 RelationInfoContainsRecurringTuples(plannerInfo, innerrel,
+													 &recurType)) ||
 				(ShouldRecurseForReferenceTableJoinChecks(outerrel) &&
-				 RelationInfoContainsReferenceTable(plannerInfo, outerrel)))
+				 RelationInfoContainsRecurringTuples(plannerInfo, outerrel, &recurType)))
 			{
-				return true;
+				break;
 			}
 		}
 	}
 
-	return false;
+	if (recurType == RECURRING_TUPLES_REFERENCE_TABLE)
+	{
+		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+							 "cannot pushdown the subquery",
+							 "There exist a reference table in the outer "
+							 "part of the outer join", NULL);
+	}
+	else if (recurType == RECURRING_TUPLES_FUNCTION)
+	{
+		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+							 "cannot pushdown the subquery",
+							 "There exist a table function in the outer "
+							 "part of the outer join", NULL);
+	}
+
+	return NULL;
 }
 
 
@@ -1683,14 +1750,17 @@ ShouldRecurseForReferenceTableJoinChecks(RelOptInfo *relOptInfo)
 
 
 /*
- * RelationInfoContainsReferenceTable checks whether the relationInfo
- * contains any reference tables. If found, the function returns true.
+ * RelationInfoContainsRecurringTuples checks whether the relationInfo
+ * contains any recurring table expression, namely a reference table,
+ * or immutable function. If found, RelationInfoContainsRecurringTuples
+ * returns true.
  *
  * Note that since relation ids of relationInfo indexes to the range
  * table entry list of planner info, planner info is also passed.
  */
 static bool
-RelationInfoContainsReferenceTable(PlannerInfo *plannerInfo, RelOptInfo *relationInfo)
+RelationInfoContainsRecurringTuples(PlannerInfo *plannerInfo, RelOptInfo *relationInfo,
+									RecurringTuplesType *recurType)
 {
 	Relids relids = bms_copy(relationInfo->relids);
 	int relationId = -1;
@@ -1700,7 +1770,7 @@ RelationInfoContainsReferenceTable(PlannerInfo *plannerInfo, RelOptInfo *relatio
 		RangeTblEntry *rangeTableEntry = plannerInfo->simple_rte_array[relationId];
 
 		/* relationInfo has this range table entry */
-		if (HasReferenceTable((Node *) rangeTableEntry))
+		if (HasRecurringTuples((Node *) rangeTableEntry, recurType))
 		{
 			return true;
 		}
@@ -1711,29 +1781,57 @@ RelationInfoContainsReferenceTable(PlannerInfo *plannerInfo, RelOptInfo *relatio
 
 
 /*
- * HasReferenceTable checks whether there exist a reference table in the
- * given node.
+ * HasRecurringTuples returns whether any part of the expression
+ * is recurring in every shard query.
  */
 bool
-HasReferenceTable(Node *node)
+HasRecurringTuples(Node *node, RecurringTuplesType *recurType)
 {
-	List *relationList = NIL;
-	ListCell *relationCell = NULL;
-	ExtractRangeTableRelationWalkerWithRTEExpand(node, &relationList);
-
-	foreach(relationCell, relationList)
+	if (node == NULL)
 	{
-		RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(relationCell);
-		Oid relationId = rangeTableEntry->relid;
-
-		if (IsDistributedTable(relationId) && PartitionMethod(relationId) ==
-			DISTRIBUTE_BY_NONE)
-		{
-			return true;
-		}
+		return false;
 	}
 
-	return false;
+	if (IsA(node, RangeTblEntry))
+	{
+		RangeTblEntry *rangeTableEntry = (RangeTblEntry *) node;
+
+		if (rangeTableEntry->rtekind == RTE_RELATION)
+		{
+			Oid relationId = rangeTableEntry->relid;
+			if (IsDistributedTable(relationId) &&
+				PartitionMethod(relationId) == DISTRIBUTE_BY_NONE)
+			{
+				*recurType = RECURRING_TUPLES_REFERENCE_TABLE;
+
+				/*
+				 * Tuples from reference tables will recur in every shard query
+				 * that includes it.
+				 */
+				return true;
+			}
+		}
+		else if (rangeTableEntry->rtekind == RTE_FUNCTION)
+		{
+			*recurType = RECURRING_TUPLES_FUNCTION;
+
+			/*
+			 * Tuples from functions will recur in every shard query that includes
+			 * it.
+			 */
+			return true;
+		}
+
+		return range_table_walker(list_make1(rangeTableEntry), HasRecurringTuples,
+								  recurType, 0);
+	}
+	else if (IsA(node, Query))
+	{
+		return query_tree_walker((Query *) node, HasRecurringTuples,
+								 recurType, QTW_EXAMINE_RTES);
+	}
+
+	return expression_tree_walker(node, HasRecurringTuples, recurType);
 }
 
 
@@ -3096,54 +3194,6 @@ ExtractRangeTableRelationWalker(Node *node, List **rangeTableRelationList)
 		{
 			(*rangeTableRelationList) = lappend(*rangeTableRelationList, rangeTableEntry);
 		}
-	}
-
-	return walkIsComplete;
-}
-
-
-/*
- * ExtractRangeTableRelationWalkerWithRTEExpand obtains the list of relations
- * from the given node. Note that the difference between this function and
- * ExtractRangeTableRelationWalker is that this one recursively
- * walk into range table entries if it can.
- */
-bool
-ExtractRangeTableRelationWalkerWithRTEExpand(Node *node, List **rangeTableRelationList)
-{
-	bool walkIsComplete = false;
-
-	if (node == NULL)
-	{
-		return walkIsComplete;
-	}
-	else if (IsA(node, RangeTblEntry))
-	{
-		RangeTblEntry *rangeTableEntry = (RangeTblEntry *) node;
-		List *rangeTableList = list_make1(rangeTableEntry);
-
-		if (rangeTableEntry->rtekind == RTE_RELATION)
-		{
-			(*rangeTableRelationList) = lappend(*rangeTableRelationList, rangeTableEntry);
-		}
-		else
-		{
-			walkIsComplete = range_table_walker(rangeTableList,
-												ExtractRangeTableRelationWalkerWithRTEExpand,
-												rangeTableRelationList, 0);
-		}
-	}
-	else if (IsA(node, Query))
-	{
-		walkIsComplete = query_tree_walker((Query *) node,
-										   ExtractRangeTableRelationWalkerWithRTEExpand,
-										   rangeTableRelationList, QTW_EXAMINE_RTES);
-	}
-	else
-	{
-		walkIsComplete = expression_tree_walker(node,
-												ExtractRangeTableRelationWalkerWithRTEExpand,
-												rangeTableRelationList);
 	}
 
 	return walkIsComplete;

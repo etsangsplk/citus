@@ -1866,7 +1866,7 @@ FROM (SELECT
 WHERE b.user_id IS NULL 
 GROUP BY a.user_id;  
 ERROR:  cannot push down this subquery
-DETAIL:  Table expressions other than simple relations and subqueries are currently unsupported
+DETAIL:  VALUES in multi-shard queries is currently unsupported
 -- same query without LIMIT/OFFSET returns 30 rows
 SET client_min_messages TO DEBUG1;
 -- now, lets use a simple expression on the LIMIT and explicit coercion on the OFFSET
