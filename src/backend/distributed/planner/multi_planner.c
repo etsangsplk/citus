@@ -71,15 +71,26 @@ static CustomScanMethods DelayedErrorCustomScanMethods = {
 	DelayedErrorCreateScan
 };
 
+
 /*
  * CteReferenceWalkerContext is used to collect CTE references in
  * CteReferenceListWalker.
  */
-struct CteReferenceWalkerContext
+typedef struct CteReferenceWalkerContext
 {
 	int level;
 	List *cteReferenceList;
-};
+} CteReferenceWalkerContext;
+
+/*
+ * VarLevelsUpWalkerContext is used to find Vars in a (sub)query that
+ * refer to upper levels and therefore cannot be planned separately.
+ */
+typedef struct VarLevelsUpWalkerContext
+{
+	int level;
+} VarLevelsUpWalkerContext;
+
 
 
 /* local function forward declarations */
@@ -92,12 +103,13 @@ static void AdjustParseTree(Query *parse, bool assignRTEIdentities,
 							bool setPartitionedTablesInherited);
 static void AssignRTEIdentity(RangeTblEntry *rangeTableEntry, int rteIdentifier);
 static void PlanPullPushCTEs(Query *query, List **subPlanList);
-static bool CteReferenceListWalker(Node *node, struct CteReferenceWalkerContext *context);
+static bool CteReferenceListWalker(Node *node, CteReferenceWalkerContext *context);
 static bool ContainsResultFunctionWalker(Node *node, void *context);
 static void PlanPullPushSubqueries(Query *query, List **subPlanList);
 static bool PlanPullPushSubqueriesWalker(Node *node, List **planList);
-static bool ContainsReferencesToOuterQuery(Node *node);
-static bool ContainsReferencesToOuterQueryWalker(Node *node, void *context);
+static bool ContainsReferencesToOuterQuery(Query *query);
+static bool ContainsReferencesToOuterQueryWalker(Node *node,
+												 VarLevelsUpWalkerContext *context);
 static Query * BuildSubPlanResultQuery(Query *subquery, int subPlanId);
 static void RemoveRTEsFromPlannerRestrictionContext(List *rangeTableList);
 static bool RangeTableListContainsIdentity(List *rangeTableList, int rteIdentity);
@@ -694,7 +706,7 @@ static void
 PlanPullPushCTEs(Query *query, List **subPlanList)
 {
 	ListCell *cteCell = NULL;
-	struct CteReferenceWalkerContext context = { -1, NIL };
+	CteReferenceWalkerContext context = { -1, NIL };
 
 	/* get all RTE_CTEs that point to CTEs from cteList */
 	CteReferenceListWalker((Node *) query, &context);
@@ -710,6 +722,13 @@ PlanPullPushCTEs(Query *query, List **subPlanList)
 		PlannedStmt *subPlan = NULL;
 		ListCell *rteCell = NULL;
 		int cursorOptions = 0;
+
+		if (ContainsReferencesToOuterQuery(subquery))
+		{
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("CTEs that refer to other subqueries are not "
+								   "supported in multi-shard queries")));
+		}
 
 		/* build a subplan for the CTE */
 		resultQuery = BuildSubPlanResultQuery(subquery, subPlanId);
@@ -779,7 +798,7 @@ PlanPullPushCTEs(Query *query, List **subPlanList)
  * CteReferenceList
  */
 static bool
-CteReferenceListWalker(Node *node, struct CteReferenceWalkerContext *context)
+CteReferenceListWalker(Node *node, CteReferenceWalkerContext *context)
 {
 	if (node == NULL)
 	{
@@ -863,10 +882,7 @@ PlanPullPushSubqueriesWalker(Node *node, List **subPlanList)
 
 		PlanPullPushSubqueries(query, subPlanList);
 
-		StringInfo s = makeStringInfo();
-		pg_get_query_def(query, s);
-
-		if (ContainsReferencesToOuterQuery((Node *) query))
+		if (ContainsReferencesToOuterQuery(query))
 		{
 			return false;
 		}
@@ -881,9 +897,11 @@ PlanPullPushSubqueriesWalker(Node *node, List **subPlanList)
 
 			resultQuery = BuildSubPlanResultQuery(query, subPlanId);
 
+			StringInfo s = makeStringInfo();
+			pg_get_query_def(query, s);
+
 			StringInfo r = makeStringInfo();
 			pg_get_query_def(resultQuery, r);
-
 			elog(DEBUG1, "replacing subquery %s with: %s", s->data, r->data);
 
 			if (ContainsResultFunctionWalker((Node *) query, NULL))
@@ -906,15 +924,25 @@ PlanPullPushSubqueriesWalker(Node *node, List **subPlanList)
 }
 
 
+/*
+ * ContainsReferencesToOuterQuery
+ */
 static bool
-ContainsReferencesToOuterQuery(Node *node)
+ContainsReferencesToOuterQuery(Query *query)
 {
-	return ContainsReferencesToOuterQueryWalker(node, NULL);
+	VarLevelsUpWalkerContext context = { 0 };
+	int flags = 0;
+
+	return query_tree_walker(query, ContainsReferencesToOuterQueryWalker,
+							 &context, flags);
 }
 
 
+/*
+ * ContainsReferencesToOuterQueryWalker
+ */
 static bool
-ContainsReferencesToOuterQueryWalker(Node *node, void *context)
+ContainsReferencesToOuterQueryWalker(Node *node, VarLevelsUpWalkerContext *context)
 {
 	if (node == NULL)
 	{
@@ -923,10 +951,11 @@ ContainsReferencesToOuterQueryWalker(Node *node, void *context)
 
 	if (IsA(node, Var))
 	{
-		if (((Var *) node)->varlevelsup > 0)
+		if (((Var *) node)->varlevelsup > context->level)
 		{
 			return true;
 		}
+
 		return false;
 	}
 
@@ -937,13 +966,30 @@ ContainsReferencesToOuterQueryWalker(Node *node, void *context)
 
 	if (IsA(node, PlaceHolderVar))
 	{
-		if (((PlaceHolderVar *) node)->phlevelsup > 0)
+		if (((PlaceHolderVar *) node)->phlevelsup > context->level)
 		{
 			return true;
 		}
 	}
 
-	return expression_tree_walker(node, ContainsReferencesToOuterQueryWalker, context);
+	if (IsA(node, Query))
+	{
+		Query *query = (Query *) node;
+		bool found = false;
+		int flags = 0;
+
+		context->level += 1;
+		found = query_tree_walker(query, ContainsReferencesToOuterQueryWalker,
+								  context, flags);
+		context->level -= 1;
+
+		return found;
+	}
+	else
+	{
+		return expression_tree_walker(node, ContainsReferencesToOuterQueryWalker,
+									  context);
+	}
 }
 
 
